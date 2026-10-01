@@ -175,3 +175,39 @@ cd ~/.hermes/hermes-agent
 ```
 
 Expected: `ALL CHECKS PASSED`.
+
+## Report
+
+`api_recorder_report.py` reads the JSONL files and prints per-model health:
+
+```bash
+python3 ~/.hermes/plugins/api-recorder/api_recorder_report.py
+python3 ~/.hermes/plugins/api-recorder/api_recorder_report.py --hours 6
+python3 ~/.hermes/plugins/api-recorder/api_recorder_report.py --with-synthetic
+```
+
+Sample output:
+
+```
+api-recorder report  |  8 intervals  |  2026-10-01T17:50:10Z .. 2026-10-01T19:12:22Z
+
+model                             prov          tot   ok  EMPTY  429  to  499  err    avg_s  alert
+--------------------------------------------------------------------------------------------
+hermes-worker                     custom:omni   437  434      1    0   0    0    2     14.4  empty_content=1
+gateway combo                     custom         67   67      0    0   0    0    0     10.4
+review combo                      custom         39   39      0    0   0    0    0      5.6
+main combo                        custom         12   12      0    0   0    0    0     10.9
+
+total calls: 555
+  success             552  (99.5%)
+  empty_content         1  (0.2%)
+  other_error           2  (0.4%)
+```
+
+`EMPTY`, `429` and `to` (stream timeout) are the columns worth watching — those are the
+failures that are otherwise invisible. The script exits non-zero and says so plainly if the
+plugin has recorded nothing, rather than printing an empty table that reads like "all fine".
+
+Records from the plugin's own self-test are skipped by default: a test run forces a flush and
+so emits a burst of records seconds apart, while real flushes are one interval (default 600 s)
+or more apart. Pass `--with-synthetic` to include them.
