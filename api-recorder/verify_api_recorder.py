@@ -5,8 +5,9 @@ Run with Hermes venv:
     cd ~/.hermes/hermes-agent && ./venv/bin/python ~/.hermes/plugins/api-recorder/verify_api_recorder.py
 
 Checks:
-  1. discover_and_load() registers plugin and its declared hooks (no rejection)
-  2. Synthetic call records pushed through ingest → summary emitted + JSONL written
+  1. discover_and_load() registers the INSTALLED plugin and its declared hooks
+  2. Synthetic calls through the checkout next to this script → summary emitted +
+     JSONL written; every FailoverReason member must land in exactly one counter
   3. py_compile on every .py file in the plugin
   4. git status clean, file list
 """
@@ -26,7 +27,7 @@ home = os.environ.get("HERMES_HOME") or os.path.expanduser("~/.hermes")
 agent_dir = os.path.join(home, "hermes-agent")
 sys.path.insert(0, agent_dir)
 
-PLUGIN_DIR = Path(home) / "plugins" / "api-recorder"
+PLUGIN_DIR = Path(home) / "plugins" / "api-recorder"  # installed copy (check 1)
 # The checkout this script ships in — same directory as the file itself, so it
 # works from a clone, a symlinked plugin dir, or a plain copy.
 PROJECT_DIR = Path(__file__).resolve().parent
@@ -62,7 +63,11 @@ except Exception as exc:
 # ── 2. Synthetic ingest + flush ───────────────────────────────────────────────
 print("\n=== [2] Synthetic ingest + JSONL emit ===")
 try:
-    plugin_path = PLUGIN_DIR / "__init__.py"
+    # Load the copy this script ships in (PROJECT_DIR), NOT the installed one:
+    # ~/.hermes/plugins/api-recorder is a symlink that can lag behind the checkout,
+    # and silently testing a stale copy hides real edits. Check [1] is the one that
+    # exercises the installed path, via discover_and_load().
+    plugin_path = PROJECT_DIR / "__init__.py"
     spec = importlib.util.spec_from_file_location("api_recorder", plugin_path)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
@@ -96,6 +101,15 @@ try:
                               status_code=499, reason="client_abort")
     mod._on_api_request_error(model="slow-model", provider="other",
                               reason="timeout")
+    # one per new counter, so a mapping typo fails here
+    for reason in ("auth", "auth_permanent", "billing", "overloaded",
+                   "server_error", "context_overflow", "payload_too_large",
+                   "long_context_tier", "oauth_long_context_beta_forbidden",
+                   "content_policy_blocked", "provider_policy_blocked",
+                   "model_entitlement", "model_not_found", "upstream_blocked",
+                   "ssl_cert_verification", "format_error", "unknown"):
+        mod._on_api_request_error(model="new-counters", provider="test-provider",
+                                  reason=reason)
 
     # Force flush
     mod._interval_start = time.monotonic() - 99999
@@ -130,6 +144,37 @@ try:
         "every recorded call must land in exactly one bucket")
     sm = bkts[("slow-model", "other")]
     assert sm["stream_timeout"] == 1, f"stream_timeout={sm['stream_timeout']}"
+
+    nc = bkts[("new-counters", "test-provider")]
+    for name, n in (("auth", 2), ("billing", 1), ("overloaded", 1),
+                    ("server_error", 1), ("context_overflow", 4),
+                    ("policy_blocked", 5), ("tls_error", 1), ("other_error", 2)):
+        assert nc[name] == n, f"{name}={nc[name]} (expected {n}): {nc}"
+    assert sum(nc[k] for k in mod.ERROR_COUNTERS) == nc["total"] == 17, nc
+
+    # Every FailoverReason member must reach some counter, and REASON_COUNTER
+    # must not name a member that does not exist (core is read-only truth).
+    from agent.error_classifier import FailoverReason
+    members = {m.value for m in FailoverReason}
+    stale = set(mod.REASON_COUNTER) - members
+    assert not stale, f"REASON_COUNTER names non-existent members: {stale}"
+    dist = {}
+    for m in FailoverReason:
+        mod._buckets.clear()  # fresh bucket per member, else counts accumulate
+        kw = {"model": "m", "provider": "p"}
+        mod._on_api_request_error(reason=m.value, **kw)
+        b = mod._get_bucket(kw)
+        hit = [c for c in mod.ERROR_COUNTERS if getattr(b, c)]
+        assert len(hit) == 1, f"{m.value} landed in {hit or 'nothing'}"
+        dist.setdefault(hit[0], []).append(m.value)
+    mod._buckets.clear()
+    mod._interval_start = time.monotonic()
+    print(f"  FailoverReason sweep ({len(members)} members):")
+    for counter, vals in sorted(dist.items(), key=lambda kv: (len(kv[1]), kv[0])):
+        tag = " (pre-existing HTTP branch)" if counter in ("rate_limit", "stream_timeout", "client_abort") else ""
+        print(f"    {counter:<17} {len(vals):>2}  {', '.join(sorted(vals))}{tag}")
+    assert sum(len(v) for v in dist.values()) == len(members), dist
+    assert all(set(v) & members for v in dist.values()), dist
     print(f"  {PASS} ingest + JSONL verified")
     results.append(("synthetic_ingest", True))
 except Exception as exc:

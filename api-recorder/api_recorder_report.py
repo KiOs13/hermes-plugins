@@ -18,10 +18,32 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 BUCKETS = ("success", "empty_content", "aborted", "rate_limit",
-           "stream_timeout", "client_abort", "other_error")
-# Counters worth alerting on: a provider that answers 200 with nothing, or a
-# model that has exhausted its quota. Everything else is context.
-ALERT = {"empty_content", "rate_limit", "stream_timeout"}
+           "stream_timeout", "client_abort", "auth", "billing", "overloaded",
+           "server_error", "context_overflow", "policy_blocked", "tls_error",
+           "other_error")
+# Counters worth alerting on: a provider that answers 200 with nothing, a model
+# that has exhausted its quota, or a hard failure class that needs a human
+# (credentials, credit, a blocked model, a broken cert chain). Everything else
+# is context.
+ALERT = {"empty_content", "rate_limit", "stream_timeout",
+         "auth", "billing", "policy_blocked", "tls_error"}
+# The table has no room for 7 more columns, so the named error counters collapse
+# into one cell listing only the non-zero ones. auth and billing stay separate
+# entries, so they are still distinguishable at a glance.
+NAMED_ERRORS = ("rate_limit", "stream_timeout", "client_abort", "auth", "billing",
+                "overloaded", "server_error", "context_overflow", "policy_blocked",
+                "tls_error", "other_error")
+SHORT = {"empty_content": "EMPTY", "rate_limit": "429", "stream_timeout": "to",
+         "client_abort": "499",
+         "auth": "auth", "billing": "bill", "overloaded": "ovl",
+         "server_error": "5xx", "context_overflow": "ctx", "policy_blocked": "pol",
+         "tls_error": "tls", "other_error": "oth"}
+
+
+def err_cell(c: dict) -> str:
+    """Compact 'auth=1 pol=2' cell — only counters that actually fired."""
+    parts = [f"{SHORT[n]}={c[n]}" for n in NAMED_ERRORS if c.get(n)]
+    return " ".join(parts) if parts else "-"
 
 
 def state_dir() -> Path:
@@ -141,8 +163,8 @@ def main() -> int:
     print(f"api-recorder report  |  {len(records)} intervals  |  "
           f"{first_ts} .. {last_ts}")
     print()
-    hdr = (f"{'model':<34}{'prov':<12}{'tot':>5}{'ok':>5}{'EMPTY':>7}"
-           f"{'429':>5}{'to':>4}{'499':>5}{'err':>5}  {'avg_s':>7}  alert")
+    hdr = (f"{'model':<26}{'prov':<12}{'tot':>5}{'ok':>5}{'EMPTY':>7}"
+           f"{'avg_s':>7}  {'errors':<46} alert")
     print(hdr)
     print("-" * len(hdr))
     flagged = 0
@@ -156,10 +178,9 @@ def main() -> int:
         bad = {k: c[k] for k in ALERT if c.get(k)}
         if bad:
             flagged += 1
-        mark = " ".join(f"{k}={v}" for k, v in sorted(bad.items())) if bad else ""
-        print(f"{model[:33]:<34}{prov[:11]:<12}{c['total']:>5}{c['success']:>5}"
-              f"{c['empty_content']:>7}{c['rate_limit']:>5}{c['stream_timeout']:>4}"
-              f"{c['client_abort']:>5}{c['other_error']:>5}  {avg:>7.1f}  {mark}")
+        mark = " ".join(f"{SHORT[k]}={v}" for k, v in sorted(bad.items())) if bad else ""
+        print(f"{model[:25]:<26}{prov[:11]:<12}{c['total']:>5}{c['success']:>5}"
+              f"{c['empty_content']:>7}{avg:>7.1f}  {err_cell(c):<46} {mark}")
 
     totals = {k: sum(agg[key][k] for key in agg) for k in BUCKETS}
     total_calls = sum(agg[key]["total"] for key in agg)

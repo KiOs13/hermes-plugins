@@ -14,10 +14,13 @@ Measures per (model, provider):
   - aborted (HTTP 200, no content AND no tool calls, finish_reason says the call was
     aborted/cancelled — the client went away mid-call; 499 itself only reaches us via
     the error path, since post_api_request carries no status_code)
-  - rate_limit (429 / reason=="rate_limit")
-  - stream_timeout (504 / reason=="stream_timeout")
-  - client_abort (499 / reason=="client_abort")
-  - other_error (non-2xx not in above buckets)
+  - rate_limit (429 / reason contains "rate_limit")
+  - stream_timeout (408/504 / reason=="timeout")
+  - client_abort (499)
+  - auth, billing, overloaded, server_error, context_overflow, policy_blocked —
+    named buckets keyed on the classifier's FailoverReason (recovery strategy,
+    not HTTP code), see REASON_COUNTER
+  - other_error (remainder — nothing is ever silently dropped)
   - latency stats (count, min, avg, approx-p95, max) from api_duration
 
 Design constraints: fail-open, unbounded-memory-safe (flush + reset each
@@ -82,6 +85,49 @@ class _LatencyBuf:
 # (it carries finish_reason, no status_code). 499 itself arrives via api_request_error.
 _ABORT_FINISH_REASONS = {"error", "abort", "aborted", "cancelled", "canceled", "client_abort"}
 
+# Error counters, in report order. rate_limit / stream_timeout / client_abort keep
+# their pre-existing HTTP-code-first meaning and are handled before this table.
+ERROR_COUNTERS = ("rate_limit", "stream_timeout", "client_abort", "auth", "billing",
+                  "overloaded", "server_error", "context_overflow", "policy_blocked",
+                  "tls_error", "other_error")
+
+# FailoverReason value -> counter. Keys checked against agent/error_classifier.py
+# FailoverReason (29 members) by verify_api_recorder.py; members not listed here
+# fall through to other_error on purpose — that bucket must never be removed.
+# Grouping rule: one counter per RECOVERY ACTION, not per enum member.
+#   auth              auth, auth_permanent            — credential/refresh path
+#   billing           billing                         — rotate to a funded account
+#   overloaded        overloaded                      — backoff, provider busy
+#   server_error      server_error                    — plain retry
+#   context_overflow  context_overflow, payload_too_large,
+#                     long_context_tier,
+#                     oauth_long_context_beta_forbidden — shrink the request
+#   policy_blocked    content_policy_blocked, provider_policy_blocked,
+#                     model_entitlement, model_not_found,
+#                     upstream_blocked                 — change model/account/destination
+#   tls_error         ssl_cert_verification           — deterministic cert chain, fail fast
+# Everything else (format_error, role_alternation, invalid_encrypted_content,
+# multimodal_tool_content_unsupported, reasoning_mandatory, thinking_signature,
+# llama_cpp_grammar_pattern, image_too_large, image_corrupt, incomplete_response,
+# unknown) keeps the other_error catch-all until one of them shows up in production.
+# upstream_rate_limit and timeout are handled by the pre-existing substring/equality
+# branches above, so they never reach this table.
+REASON_COUNTER = {
+    "auth": "auth", "auth_permanent": "auth",
+    "billing": "billing",
+    "overloaded": "overloaded",
+    "server_error": "server_error",
+    "context_overflow": "context_overflow", "payload_too_large": "context_overflow",
+    "long_context_tier": "context_overflow",
+    "oauth_long_context_beta_forbidden": "context_overflow",
+    "content_policy_blocked": "policy_blocked",
+    "provider_policy_blocked": "policy_blocked",
+    "model_entitlement": "policy_blocked",
+    "model_not_found": "policy_blocked",
+    "upstream_blocked": "policy_blocked",
+    "ssl_cert_verification": "tls_error",
+}
+
 
 def _classify_post(kw: dict) -> str:
     """Return 'success' | 'aborted' | 'empty_content' for a post_api_request event.
@@ -99,19 +145,15 @@ def _classify_post(kw: dict) -> str:
 
 
 class _Bucket:
-    __slots__ = ("total", "success", "empty_content", "aborted",
-                 "rate_limit", "stream_timeout", "client_abort", "other_error",
-                 "lat")
+    __slots__ = ("total", "success", "empty_content", "aborted", "lat", *ERROR_COUNTERS)
 
     def __init__(self) -> None:
         self.total = 0
         self.success = 0
         self.empty_content = 0
         self.aborted = 0
-        self.rate_limit = 0
-        self.stream_timeout = 0
-        self.client_abort = 0
-        self.other_error = 0
+        for name in ERROR_COUNTERS:
+            setattr(self, name, 0)
         self.lat = _LatencyBuf()
 
     def as_dict(self) -> dict[str, Any]:
@@ -120,11 +162,9 @@ class _Bucket:
             "success": self.success,
             "empty_content": self.empty_content,
             "aborted": self.aborted,
-            "rate_limit": self.rate_limit,
-            "stream_timeout": self.stream_timeout,
-            "client_abort": self.client_abort,
-            "other_error": self.other_error,
         }
+        for name in ERROR_COUNTERS:
+            d[name] = getattr(self, name)
         lat = self.lat.stats()
         if lat:
             d["latency_s"] = lat
@@ -161,11 +201,11 @@ def _flush(buckets: dict, interval_start: float, interval_end: float) -> None:
     rows = []
     for (model, provider), b in sorted(buckets.items()):
         d = b.as_dict()
+        errs = " ".join(f"{n}={d[n]}" for n in ERROR_COUNTERS if d[n])
         lines.append(
             f"  {model}/{provider}: total={d['total']} ok={d['success']}"
-            f" empty={d['empty_content']} abrt={d['aborted']} rl={d['rate_limit']}"
-            f" timeout={d['stream_timeout']} cabort={d['client_abort']}"
-            f" err={d['other_error']}"
+            f" empty={d['empty_content']} abrt={d['aborted']}"
+            + (f" {errs}" if errs else " err=none")
             + (f" lat={d['latency_s']}" if "latency_s" in d else "")
         )
         rows.append({"model": model, "provider": provider, **d})
@@ -234,7 +274,9 @@ def _on_post_api_request(**kw: Any) -> None:
 def _on_api_request_error(**kw: Any) -> None:
     try:
         status = kw.get("status_code") or 0
-        reason = (kw.get("reason") or "").lower()
+        raw = kw.get("reason")
+        # Core passes the FailoverReason value (a str), but accepts an enum too.
+        reason = str(getattr(raw, "value", raw) or "").lower()
         with _lock:
             b = _get_bucket(kw)
             b.total += 1
@@ -245,7 +287,8 @@ def _on_api_request_error(**kw: Any) -> None:
             elif status == 499:
                 b.client_abort += 1
             else:
-                b.other_error += 1
+                name = REASON_COUNTER.get(reason, "other_error")
+                setattr(b, name, getattr(b, name) + 1)
     except Exception as exc:
         logger.debug("api-recorder: api_request_error ingest error: %s", exc)
     _maybe_flush()
@@ -301,6 +344,11 @@ def _demo() -> None:
     _on_api_request_error(model="gpt-4o", provider="openai", reason="rate_limit")
     _on_api_request_error(model="claude-3-opus", provider="anthropic",
                           reason="timeout")
+    # one per new counter, so the demo proves the mapping end-to-end
+    for reason in ("auth", "billing", "overloaded", "server_error",
+                   "context_overflow", "content_policy_blocked",
+                   "ssl_cert_verification"):
+        _on_api_request_error(model="err-model", provider="err-provider", reason=reason)
 
     # Force flush
     global _interval_start
@@ -314,7 +362,7 @@ def _demo() -> None:
     assert path.exists(), f"JSONL not written: {path}"
     last_line = path.read_text().strip().split("\n")[-1]
     record = json.loads(last_line)
-    assert len(record["buckets"]) == 2, f"Expected 2 buckets, got: {record['buckets']}"
+    assert len(record["buckets"]) == 3, f"Expected 3 buckets, got: {record['buckets']}"
     gpt = next(r for r in record["buckets"] if r["model"] == "gpt-4o")
     # 4 post_api_request (512ch, true-empty, tool-call, aborted) + 1 error
     assert gpt["total"] == 5, f"total wrong: {gpt}"
@@ -324,6 +372,14 @@ def _demo() -> None:
     assert gpt["rate_limit"] == 1, f"rate_limit wrong: {gpt}"
     anthropic = next(r for r in record["buckets"] if r["model"] == "claude-3-opus")
     assert anthropic["stream_timeout"] == 1, f"stream_timeout wrong: {anthropic}"
+    err = next(r for r in record["buckets"] if r["model"] == "err-model")
+    assert err["total"] == 7, f"err total wrong: {err}"
+    for name, n in (("auth", 1), ("billing", 1), ("overloaded", 1),
+                    ("server_error", 1), ("context_overflow", 1),
+                    ("policy_blocked", 1), ("tls_error", 1), ("other_error", 0)):
+        assert err[name] == n, f"{name} wrong: {err}"
+    # every call lands in exactly one bucket, whatever the reason was
+    assert sum(err[k] for k in ERROR_COUNTERS) == err["total"], f"bucket sum: {err}"
     print(f"\n[demo] JSONL line:\n{last_line}")
     print("\n[demo] ALL ASSERTIONS PASSED")
 

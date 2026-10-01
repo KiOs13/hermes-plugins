@@ -21,7 +21,11 @@ Additionally, stream timeouts (504) and client-aborted connections (499) often
 look identical in the agent log — both surface as a retry — but have different
 root causes (provider slowness vs. network interruption).
 
-api-recorder surfaces all four as named counters per model/provider.
+api-recorder surfaces all four as named counters per model/provider, plus a
+split of everything else the error classifier can report — `auth`, `billing`,
+`overloaded`, `server_error`, `context_overflow`, `policy_blocked`, `tls_error`
+— so a failure you cannot explain lands in `other_error` as the only remaining
+unknown, not as one entry among dozens of causes.
 
 ---
 
@@ -36,8 +40,27 @@ api-recorder surfaces all four as named counters per model/provider.
 | `rate_limit` | `api_request_error` where reason contains `rate_limit` / `429` |
 | `stream_timeout` | `api_request_error` where reason contains `stream_timeout` / `504` |
 | `client_abort` | `api_request_error` where reason contains `client_abort` / `499` |
-| `other_error` | Any other `api_request_error` |
+| `auth` | `api_request_error` with `reason` `auth` or `auth_permanent` — credentials rejected (401/403), refresh/rotate the key |
+| `billing` | `api_request_error` with `reason` `billing` — 402 or confirmed credit exhaustion, rotate to a funded account |
+| `overloaded` | `api_request_error` with `reason` `overloaded` — 503/529, provider busy, backoff |
+| `server_error` | `api_request_error` with `reason` `server_error` — 500/502, plain retry |
+| `context_overflow` | `api_request_error` with `reason` `context_overflow`, `payload_too_large`, `long_context_tier` or `oauth_long_context_beta_forbidden` — request too big, shrink it |
+| `policy_blocked` | `api_request_error` with `reason` `content_policy_blocked`, `provider_policy_blocked`, `model_entitlement`, `model_not_found` or `upstream_blocked` — this request/model/account is refused; change one of them, retrying unchanged is pointless |
+| `tls_error` | `api_request_error` with `reason` `ssl_cert_verification` — deterministic cert-chain failure, fails fast |
+| `other_error` | Any other `api_request_error`. **Catch-all on purpose** — it is never removed, so a new `FailoverReason` member can never be silently dropped |
 | `latency_s` | `{n, min, avg, p95, max}` from `api_duration` (seconds); omitted if no successful timing |
+
+The named error counters are keyed on the **recovery action** Hermes takes
+(`agent/error_classifier.py` → `FailoverReason`, 29 members), not on the HTTP
+code, because two different reasons with the same status code need different
+fixes. `verify_api_recorder.py` sweeps all 29 enum members and asserts each one
+lands in exactly one counter, and that `REASON_COUNTER` never names a member
+that no longer exists. Members sharing one recovery action share one counter;
+anything unmapped stays in `other_error`.
+
+Anything that reached `other_error` before this split cannot be re-labelled
+retroactively — the old JSONL only stored the count. Counters split from the
+next flush onward.
 
 Latency samples are capped at 1 000 per interval; p95 is exact within that
 window. Counters are reset to zero after every flush — no cumulative totals,
@@ -107,11 +130,20 @@ exist on that payload: `finish_reason`, `assistant_content_chars`,
 
 ### Journal (WARNING level)
 
+Verbatim self-test output (it forces a flush by rewinding the interval clock,
+so its `interval=` is a raw monotonic reading, not 600 — real flushes print
+elapsed seconds):
+
 ```
-WARNING api-recorder: interval=600.0s buckets=2
-  gpt-4o/openai: total=47 ok=44 empty=2 abrt=0 rl=1 timeout=0 cabort=0 err=0 lat={'n':44,'min':0.8,'avg':2.1,'p95':4.2,'max':7.3}
-  claude-3-opus/anthropic: total=12 ok=11 empty=0 abrt=0 rl=0 timeout=1 cabort=0 err=0
+WARNING api-recorder: interval=1790896115.5s buckets=3
+  claude-3-opus/anthropic: total=2 ok=1 empty=0 abrt=0 stream_timeout=1 lat={'n': 1, 'min': 2.5, 'avg': 2.5, 'p95': 2.5, 'max': 2.5}
+  err-model/err-provider: total=7 ok=0 empty=0 abrt=0 auth=1 billing=1 overloaded=1 server_error=1 context_overflow=1 policy_blocked=1 tls_error=1
+  gpt-4o/openai: total=5 ok=2 empty=1 abrt=1 rate_limit=1 lat={'n': 4, 'min': 0.8, 'avg': 8.225, 'p95': 30.0, 'max': 30.0}
 ```
+
+Only non-zero error counters are printed (`err=none` when there were no
+failures at all), so the list after `abrt=` is exactly the list of things that
+went wrong.
 
 ```bash
 journalctl --user -u hermes-gateway -p warning -g api-recorder
@@ -123,10 +155,13 @@ One line per flush interval. Each line is a JSON object:
 
 ```json
 {"ts":"2026-10-01T12:00:00Z","interval_s":600.0,"buckets":[
-  {"model":"gpt-4o","provider":"openai","total":47,"success":44,"empty_content":2,"aborted":0,"rate_limit":1,"stream_timeout":0,"client_abort":0,"other_error":0,"latency_s":{"n":44,"min":0.8,"avg":2.1,"p95":4.2,"max":7.3}},
-  {"model":"claude-3-opus","provider":"anthropic","total":12,"success":11,"empty_content":0,"aborted":0,"rate_limit":0,"stream_timeout":1,"client_abort":0,"other_error":0}
+  {"model":"gpt-4o","provider":"openai","total":5,"success":2,"empty_content":1,"aborted":1,"rate_limit":1,"stream_timeout":0,"client_abort":0,"auth":0,"billing":0,"overloaded":0,"server_error":0,"context_overflow":0,"policy_blocked":0,"tls_error":0,"other_error":0,"latency_s":{"n":4,"min":0.8,"avg":8.225,"p95":30.0,"max":30.0}},
+  {"model":"err-model","provider":"err-provider","total":7,"success":0,"empty_content":0,"aborted":0,"rate_limit":0,"stream_timeout":0,"client_abort":0,"auth":1,"billing":1,"overloaded":1,"server_error":1,"context_overflow":1,"policy_blocked":1,"tls_error":1,"other_error":0}
 ]}
 ```
+
+Every counter is always present, zeroed or not — a missing key would make
+"no `auth` failures" indistinguishable from "old plugin version".
 
 Parse with any JSON tool:
 
@@ -174,7 +209,23 @@ cd ~/.hermes/hermes-agent
 ./venv/bin/python ~/.hermes/plugins/api-recorder/verify_api_recorder.py
 ```
 
-Expected: `ALL CHECKS PASSED`.
+Expected: `ALL CHECKS PASSED`. Check [2] also sweeps all 29 `FailoverReason`
+members and prints where each one lands, so a new enum member in core shows up
+here before it can hide in `other_error`:
+
+```
+FailoverReason sweep (29 members):
+    billing            1  billing
+    overloaded         1  overloaded
+    server_error       1  server_error
+    stream_timeout     1  timeout (pre-existing HTTP branch)
+    tls_error          1  ssl_cert_verification
+    auth               2  auth, auth_permanent
+    rate_limit         2  rate_limit, upstream_rate_limit (pre-existing HTTP branch)
+    context_overflow   4  context_overflow, long_context_tier, oauth_long_context_beta_forbidden, payload_too_large
+    policy_blocked     5  content_policy_blocked, model_entitlement, model_not_found, provider_policy_blocked, upstream_blocked
+    other_error       11  format_error, image_corrupt, image_too_large, incomplete_response, invalid_encrypted_content, llama_cpp_grammar_pattern, multimodal_tool_content_unsupported, reasoning_mandatory, role_alternation, thinking_signature, unknown
+```
 
 ## Report
 
@@ -186,27 +237,48 @@ python3 ~/.hermes/plugins/api-recorder/api_recorder_report.py --hours 6
 python3 ~/.hermes/plugins/api-recorder/api_recorder_report.py --with-synthetic
 ```
 
-Sample output:
+Sample output (real run of this script against a real data dir, model and
+provider names genericised):
 
 ```
-api-recorder report  |  8 intervals  |  2026-10-01T17:50:10Z .. 2026-10-01T19:12:22Z
+api-recorder report  |  14 intervals  |  2026-10-01T17:50:10Z .. 2026-10-01T20:06:44Z
 
-model                             prov          tot   ok  EMPTY  429  to  499  err    avg_s  alert
---------------------------------------------------------------------------------------------
-hermes-worker                     custom:omni   437  434      1    0   0    0    2     14.4  empty_content=1
-gateway combo                     custom         67   67      0    0   0    0    0     10.4
-review combo                      custom         39   39      0    0   0    0    0      5.6
-main combo                        custom         12   12      0    0   0    0    0     10.9
+model                     prov          tot   ok  EMPTY  avg_s  errors                                         alert
+--------------------------------------------------------------------------------------------------------------------
+worker combo              custom:stac   763  760      1   12.6  oth=2                                          EMPTY=1
+gateway combo             custom         90   90      0   10.9  -                                              
+review combo              custom         50   50      0    5.8  -                                              
+main combo                custom         28   28      0   10.2  -                                              
+worker combo              custom:stac     7    0      0    0.0  auth=1 bill=1 ovl=1 5xx=1 ctx=1 pol=1 tls=1    auth=1 bill=1 pol=1 tls=1
 
-total calls: 555
-  success             552  (99.5%)
-  empty_content         1  (0.2%)
-  other_error           2  (0.4%)
+total calls: 938
+  success             928  (98.9%)
+  empty_content         1  (0.1%)
+  auth                  1  (0.1%)
+  billing               1  (0.1%)
+  overloaded            1  (0.1%)
+  server_error          1  (0.1%)
+  context_overflow      1  (0.1%)
+  policy_blocked        1  (0.1%)
+  tls_error             1  (0.1%)
+  other_error           2  (0.2%)
+
+2 model bucket(s) with alert-worthy counters (auth, billing, empty_content, policy_blocked, rate_limit, stream_timeout, tls_error).
 ```
 
-`EMPTY`, `429` and `to` (stream timeout) are the columns worth watching — those are the
-failures that are otherwise invisible. The script exits non-zero and says so plainly if the
-plugin has recorded nothing, rather than printing an empty table that reads like "all fine".
+The `errors` cell lists only the counters that actually fired, so a wide table
+is not needed to see them: `auth=1 bill=1 pol=1 tls=1` reads directly as
+"credentials failed, credit ran out, a model got blocked, and a cert chain
+broke". Short codes: `429` rate limit, `to` stream timeout, `499` client abort,
+`auth`, `bill` billing, `ovl` overloaded, `5xx` server error, `ctx` context too
+big, `pol` policy/model blocked, `tls` cert chain, `oth` unclassified.
+
+The `alert` column repeats only the counters from `ALERT` — `empty_content`,
+`rate_limit`, `stream_timeout`, `auth`, `billing`, `policy_blocked`, `tls_error` —
+because those need a human; `overloaded` and `server_error` clear up on their
+own, so they show in `errors` but do not raise a flag. The script exits non-zero
+and says so plainly if the plugin has recorded nothing, rather than printing an
+empty table that reads like "all fine".
 
 Records from the plugin's own self-test are skipped by default: a test run forces a flush and
 so emits a burst of records seconds apart, while real flushes are one interval (default 600 s)
