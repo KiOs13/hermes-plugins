@@ -1,0 +1,3 @@
+name: heartbeat-guard
+version: 1.0.0
+description: Raise subagent stale-heartbeat thresholds so slow-but-alive children are not abandoned at 450s.

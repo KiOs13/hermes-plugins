@@ -1,0 +1,6 @@
+name: api-recorder
+version: 1.0.0
+description: Observe model API call health (empties, rate-limits, timeouts) and emit periodic summaries to journal and JSONL. Observer only — changes no behaviour.
+provides_hooks:
+  - post_api_request
+  - api_request_error
